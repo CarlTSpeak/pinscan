@@ -167,6 +167,7 @@ static FILE* gConcreteTraceFile = nullptr;
 static PIN_LOCK gConcreteTraceLock;
 static FILE* gTraceGuiCsvFile = nullptr;
 static PIN_LOCK gTraceGuiCsvLock;
+static UINT64 gTraceGuiCsvRows = 0;
 
 // PEB Access Detection
 static bool gPebEnabled = false;
@@ -198,6 +199,7 @@ static bool gStartRipEnabled = false;
 static bool gStartGateDisabled = false;
 static ADDRINT gStopRip = 0;
 static bool gStopRipEnabled = false;
+static std::atomic<bool> gFullInstrumentationActive{ true };
 
 static std::unordered_map<ADDRINT, InstStatic> gStaticByRip;
 static std::unordered_map<ADDRINT, std::string> gInterestingMnemonicByRip;
@@ -1090,10 +1092,18 @@ static ADDRINT CheckAndOpenGate(THREADID tid, ADDRINT rip) {
     }
     if (!st->gateOpen && rip == gStartRip) {
         st->gateOpen = true;
+        bool wasFastStart = !gFullInstrumentationActive.exchange(true, std::memory_order_acq_rel);
         PIN_GetLock(&gLock, 0);
         std::fprintf(gOut ? gOut : stderr, "[pinscan] tid=%u start hit at %s\n", (unsigned)tid, Hex(rip).c_str());
+        if (wasFastStart) {
+            std::fprintf(gOut ? gOut : stderr,
+                "[pinscan] switching from fast start-gate probe to full instrumentation\n");
+        }
         if (gOut) std::fflush(gOut);
         PIN_ReleaseLock(&gLock);
+        if (wasFastStart) {
+            PIN_RemoveInstrumentation();
+        }
         return 1;
     }
     return 0;
@@ -1315,8 +1325,10 @@ static const char* kTraceGuiRegNameByMaskIndex[16] = {
 
 void LogTraceGuiCsvRow(const TraceGuiCsvRow& row) {
     if (!gTraceGuiCsvFile) return;
-    std::string line = TraceGuiFormatRow(row);
     PIN_GetLock(&gTraceGuiCsvLock, 1);
+    TraceGuiCsvRow numbered = row;
+    numbered.index = TraceGuiHexNoPrefix(gTraceGuiCsvRows++, 5);
+    std::string line = TraceGuiFormatRow(numbered);
     std::fprintf(gTraceGuiCsvFile, "%s\n", line.c_str());
     std::fflush(gTraceGuiCsvFile);
     PIN_ReleaseLock(&gTraceGuiCsvLock);
@@ -1343,6 +1355,14 @@ static std::string TraceGuiNormalizeHexValue(const std::string& value) {
 static std::string TraceGuiMemoryValue(ADDRINT addr, UINT32 size) {
     if (addr == 0 || size == 0) return "";
     return TraceGuiNormalizeHexValue(ReadMemHex(addr, size));
+}
+
+static std::string TraceGuiHexSlice(const std::string& value, UINT32 offsetBytes, UINT32 sizeBytes) {
+    size_t start = static_cast<size_t>(offsetBytes) * 2;
+    size_t count = static_cast<size_t>(sizeBytes) * 2;
+    if (start >= value.size()) return "";
+    if (start + count > value.size()) count = value.size() - start;
+    return value.substr(start, count);
 }
 
 static std::string TraceGuiBuildRegisterColumn(const ThreadState* st) {
@@ -1377,24 +1397,44 @@ static std::string TraceGuiBuildRegisterColumn(const ThreadState* st) {
     return oss.str();
 }
 
-static void TraceGuiAppendMemCell(std::ostringstream& oss, bool& first, ADDRINT addr,
+static void TraceGuiAppendMemCell(std::ostringstream& oss, bool& first, ADDRINT addr, UINT32 size,
     const std::string& before, const std::string& after) {
     if (addr == 0 || (before.empty() && after.empty())) return;
-    if (!first) oss << ' ';
-    oss << TraceGuiHexNoPrefix(addr, 16) << ": ";
-    if (!before.empty() && !after.empty()) oss << before << "\xE2\x86\x92" << after;
-    else if (!after.empty()) oss << after;
-    else oss << before;
-    first = false;
+    UINT32 totalSize = size != 0 ? size : static_cast<UINT32>(std::max(before.size(), after.size()) / 2);
+    if (totalSize == 0) return;
+
+    for (UINT32 offset = 0; offset < totalSize; offset += 8) {
+        UINT32 chunkSize = std::min<UINT32>(8, totalSize - offset);
+        std::string beforeChunk = TraceGuiHexSlice(before, offset, chunkSize);
+        std::string afterChunk = TraceGuiHexSlice(after, offset, chunkSize);
+        if (beforeChunk.empty() && afterChunk.empty()) continue;
+
+        if (!first) oss << ' ';
+        oss << TraceGuiHexNoPrefix(addr + offset, 16) << ": ";
+        if (!beforeChunk.empty() && !afterChunk.empty()) oss << beforeChunk << "\xE2\x86\x92" << afterChunk;
+        else if (!afterChunk.empty()) oss << afterChunk;
+        else oss << beforeChunk;
+        first = false;
+    }
 }
 
 static std::string TraceGuiBuildMemoryColumn(const ThreadState* st) {
     if (!st) return "";
     std::ostringstream oss;
     bool first = true;
-    TraceGuiAppendMemCell(oss, first, st->pendingTraceGuiReadAddr1, st->pendingTraceGuiReadValue1, "");
-    TraceGuiAppendMemCell(oss, first, st->pendingTraceGuiReadAddr2, st->pendingTraceGuiReadValue2, "");
-    TraceGuiAppendMemCell(oss, first, st->pendingTraceGuiWriteAddr,
+
+    // Read-modify-write instructions report the same effective address as both a
+    // read and a write. Emit only the write cell because it has the full transition.
+    if (st->pendingTraceGuiReadAddr1 != st->pendingTraceGuiWriteAddr) {
+        TraceGuiAppendMemCell(oss, first, st->pendingTraceGuiReadAddr1, st->pendingTraceGuiReadSize1,
+            st->pendingTraceGuiReadValue1, "");
+    }
+    if (st->pendingTraceGuiReadAddr2 != st->pendingTraceGuiWriteAddr &&
+        st->pendingTraceGuiReadAddr2 != st->pendingTraceGuiReadAddr1) {
+        TraceGuiAppendMemCell(oss, first, st->pendingTraceGuiReadAddr2, st->pendingTraceGuiReadSize2,
+            st->pendingTraceGuiReadValue2, "");
+    }
+    TraceGuiAppendMemCell(oss, first, st->pendingTraceGuiWriteAddr, st->pendingTraceGuiWriteSize,
         st->pendingTraceGuiWriteBefore, st->pendingTraceGuiWriteAfter);
     return oss.str();
 }
@@ -1431,7 +1471,6 @@ static void TraceGuiEmitPending(ThreadState* st, UINT32 insSize) {
     }
 
     TraceGuiCsvRow row;
-    row.index = TraceGuiHexNoPrefix(st->pendingConcreteEntry.seq, 5);
     row.address = TraceGuiHexNoPrefix(st->pendingConcreteEntry.rip, 16);
     if (insSize == 0) {
         auto it = gStaticByRip.find(st->pendingConcreteEntry.rip);
@@ -1839,6 +1878,15 @@ static void InstrumentInstruction(INS ins, void*) {
 
     ADDRINT rip = INS_Address(ins);
 
+    if (gStartRipEnabled && !gStartGateDisabled &&
+        !gFullInstrumentationActive.load(std::memory_order_acquire)) {
+        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)CheckAndOpenGate,
+            IARG_THREAD_ID,
+            IARG_ADDRINT, rip,
+            IARG_END);
+        return;
+    }
+
     PIN_GetLock(&g_EpLock, 1);
     bool isEntryPoint = (g_DllEntryPoints.find(rip) != g_DllEntryPoints.end());
     PIN_ReleaseLock(&g_EpLock);
@@ -1852,6 +1900,7 @@ static void InstrumentInstruction(INS ins, void*) {
 
     InstStatic st{};
     st.dis = INS_Disassemble(ins);
+    st.size = INS_Size(ins);
 	// Handle RIP-relative addressing in the disassembly for better readability
     size_t ripPos = st.dis.find("rip+0x");
     if (ripPos != std::string::npos) {
@@ -2730,6 +2779,7 @@ int main(int argc, char* argv[]) {
     }
     else if (parseHex(KnobStart.Value(), gStartRip)) gStartRipEnabled = true;
     if (parseHex(KnobStop.Value(), gStopRip)) gStopRipEnabled = true;
+    gFullInstrumentationActive.store(!gStartRipEnabled || gStartGateDisabled, std::memory_order_release);
 
     auto parseTrig = [&](const std::string& b, const std::string& s, const std::string& t, const std::string& w, MemTrigger& mt) {
         if (parseHex(b, mt.base) && parseHex(s, (ADDRINT&)mt.size)) {

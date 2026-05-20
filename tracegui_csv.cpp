@@ -25,6 +25,18 @@ std::string TraceGuiCsvEscape(const std::string& value) {
     return out;
 }
 
+std::string TraceGuiCsvQuote(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 2);
+    out.push_back('"');
+    for (char ch : value) {
+        if (ch == '"') out.push_back('"');
+        out.push_back(ch);
+    }
+    out.push_back('"');
+    return out;
+}
+
 std::string TraceGuiHexNoPrefix(ADDRINT value, unsigned width) {
     std::ostringstream oss;
     oss << std::uppercase << std::hex;
@@ -64,7 +76,7 @@ std::string TraceGuiFormatRow(const TraceGuiCsvRow& row) {
     oss << TraceGuiCsvEscape(row.index) << ','
         << TraceGuiCsvEscape(row.address) << ','
         << TraceGuiCsvEscape(row.bytes) << ','
-        << TraceGuiCsvEscape(row.disassembly) << ','
+        << TraceGuiCsvQuote(row.disassembly) << ','
         << TraceGuiCsvEscape(row.registers) << ','
         << TraceGuiCsvEscape(row.memory) << ','
         << TraceGuiCsvEscape(row.comments);
