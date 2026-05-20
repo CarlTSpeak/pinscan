@@ -39,6 +39,8 @@ struct InstEntry {
 struct ThreadState {
     THREADID tid{ 0 };
     UINT64 instCount{ 0 };
+    UINT64 heartbeatLastInstCount{ 0 };
+    std::chrono::steady_clock::time_point heartbeatLastTime;
     std::vector<InstEntry> ring;
     UINT32 next{ 0 };
     bool filled{ false };

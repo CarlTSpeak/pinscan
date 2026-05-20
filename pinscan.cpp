@@ -1047,8 +1047,10 @@ static bool BuildRflagsWrite(INS ins) {
     return false;
 }
 
-static void CheckAndOpenGate(THREADID tid, ADDRINT rip, const CONTEXT* ctxt) {
-    if (!gStartRipEnabled || gStartGateDisabled) return;
+static void FlushPendingConcreteEntry(ThreadState* st, UINT32 insSize);
+
+static ADDRINT CheckAndOpenGate(THREADID tid, ADDRINT rip) {
+    if (!gStartRipEnabled || gStartGateDisabled) return 0;
 
     ThreadState* st = GetToolThreadState(tid);
     if (st && !st->gateOpen && rip == gStartRip) {
@@ -1057,33 +1059,30 @@ static void CheckAndOpenGate(THREADID tid, ADDRINT rip, const CONTEXT* ctxt) {
         std::fprintf(gOut ? gOut : stderr, "[pinscan] tid=%u start hit at %s\n", (unsigned)tid, Hex(rip).c_str());
         if (gOut) std::fflush(gOut);
         PIN_ReleaseLock(&gLock);
-
-        // TRIGGER SNAPSHOT A
-        if (gConcreteEnabled) {
-            ExecuteSnapshot(tid, ctxt, "start");
-        }
+        return 1;
     }
+    return 0;
 }
 
-static void CheckAndCloseGate(THREADID tid, ADDRINT rip, const CONTEXT* ctxt) {
-    if (!gStopRipEnabled || gStartGateDisabled) return;
+static ADDRINT GateIsOpen(THREADID tid) {
+    ThreadState* st = GetToolThreadState(tid);
+    return (st && st->gateOpen) ? 1 : 0;
+}
+
+static ADDRINT CheckAndCloseGate(THREADID tid, ADDRINT rip, UINT32 insSize) {
+    if (!gStopRipEnabled || gStartGateDisabled) return 0;
 
     ThreadState* st = GetToolThreadState(tid);
     if (st && st->gateOpen && rip == gStopRip) {
+        FlushPendingConcreteEntry(st, insSize);
         st->gateOpen = false;
         PIN_GetLock(&gLock, 0);
         std::fprintf(gOut ? gOut : stderr, "[pinscan] tid=%u end hit at %s\n", (unsigned)tid, Hex(rip).c_str());
         if (gOut) std::fflush(gOut);
         PIN_ReleaseLock(&gLock);
-
-        // TRIGGER SNAPSHOT B
-        if (gConcreteEnabled) {
-            ExecuteSnapshot(tid, ctxt, "stop");
-
-            // Optional: If you want to force kill the game after the B slice is captured to save time
-            // PIN_ExitApplication(0); 
-        }
+        return 1;
     }
+    return 0;
 }
 
 static void ResolveBootstrapSymbols(IMG img) {
@@ -1423,6 +1422,18 @@ static void TraceGuiEmitPending(ThreadState* st, UINT32 insSize) {
     TraceGuiResetPending(st);
 }
 
+static void FlushPendingConcreteEntry(ThreadState* st, UINT32 insSize) {
+    if (!st || !st->hasPendingConcrete) return;
+    TraceGuiEmitPending(st, insSize);
+    DispatchEntry(st, st->pendingConcreteEntry);
+    if (st->pendingConcreteDump && gUseRing) {
+        DumpWindow(st);
+        st->dumping = true;
+        st->postRemaining = gPostFollow;
+    }
+    st->hasPendingConcrete = false;
+}
+
 static void TraceGuiPreparePending(ThreadState* st, ADDRINT rip,
     ADDRINT r1, UINT32 r1Size, ADDRINT r2, UINT32 r2Size,
     ADDRINT w1, UINT32 w1Size) {
@@ -1476,6 +1487,13 @@ static void Record(THREADID tid, ADDRINT rip, BOOL mnemonicInteresting,
     if (gHeartbeatInterval > 0) {
         st->instCount++;
         if (st->instCount % gHeartbeatInterval == 0) {
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - st->heartbeatLastTime).count();
+            UINT64 deltaInst = st->instCount - st->heartbeatLastInstCount;
+            double ips = (elapsed > 0.0) ? (static_cast<double>(deltaInst) / elapsed) : 0.0;
+            st->heartbeatLastTime = now;
+            st->heartbeatLastInstCount = st->instCount;
+
             PIN_GetLock(&gLock, 1);
             if (gOut) {
                 std::string loc = "unknown";
@@ -1485,8 +1503,9 @@ static void Record(THREADID tid, ADDRINT rip, BOOL mnemonicInteresting,
                     oss << it->second.mod << "+" << std::hex << it->second.rva;
                     loc = oss.str();
                 }
-                std::fprintf(gOut, "[HEARTBEAT] tid=%u count=%llu rip=%s (%s)\n",
+                std::fprintf(gOut, "[HEARTBEAT] tid=%u count=%llu ips=%.0f interval=%llu elapsed=%.3fs rip=%s (%s)\n",
                     (unsigned)tid, (unsigned long long)st->instCount,
+                    ips, (unsigned long long)deltaInst, elapsed,
                     Hex(rip).c_str(), loc.c_str());
             }
             PIN_ReleaseLock(&gLock);
@@ -1790,9 +1809,33 @@ static void RecordMemWriteAfter(THREADID tid, ADDRINT rip, UINT32 size, UINT32 i
 
 static void UpdateLastRip(THREADID tid, ADDRINT rip) {
     if (ThreadState* st = GetToolThreadState(tid)) {
+        if (gStartRipEnabled && !st->gateOpen) return;
         st->lastRip = rip;
         TrackPreMainExecution(tid, rip);
         TrackExceptionResume(tid, rip);
+    }
+}
+
+static void InsertCloseGateCall(INS ins, IPOINT point, ADDRINT rip) {
+    if (!gStopRipEnabled) return;
+    if (gConcreteEnabled) {
+        INS_InsertIfCall(ins, point, (AFUNPTR)CheckAndCloseGate,
+            IARG_THREAD_ID,
+            IARG_ADDRINT, rip,
+            IARG_UINT32, INS_Size(ins),
+            IARG_END);
+        INS_InsertThenCall(ins, point, (AFUNPTR)ExecuteSnapshot,
+            IARG_THREAD_ID,
+            IARG_CONST_CONTEXT,
+            IARG_PTR, "stop",
+            IARG_END);
+    }
+    else {
+        INS_InsertCall(ins, point, (AFUNPTR)CheckAndCloseGate,
+            IARG_THREAD_ID,
+            IARG_ADDRINT, rip,
+            IARG_UINT32, INS_Size(ins),
+            IARG_END);
     }
 }
 
@@ -1898,105 +1941,218 @@ static void InstrumentInstruction(INS ins, void*) {
     INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)UpdateLastRip, IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_END);
 
     if (gStartRipEnabled) {
-        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)CheckAndOpenGate,
-            IARG_THREAD_ID,
-            IARG_ADDRINT, rip,
-            IARG_CONST_CONTEXT,  // <--- ADDED THIS
-            IARG_END);
-    }
-
-    if (gStopRipEnabled) {
-        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)CheckAndCloseGate,
-            IARG_THREAD_ID,
-            IARG_ADDRINT, rip,
-            IARG_CONST_CONTEXT,  // <--- ADDED THIS
-            IARG_END);
+        if (gConcreteEnabled) {
+            INS_InsertIfCall(ins, IPOINT_BEFORE, (AFUNPTR)CheckAndOpenGate,
+                IARG_THREAD_ID,
+                IARG_ADDRINT, rip,
+                IARG_END);
+            INS_InsertThenCall(ins, IPOINT_BEFORE, (AFUNPTR)ExecuteSnapshot,
+                IARG_THREAD_ID,
+                IARG_CONST_CONTEXT,
+                IARG_PTR, "start",
+                IARG_END);
+        }
+        else {
+            INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)CheckAndOpenGate,
+                IARG_THREAD_ID,
+                IARG_ADDRINT, rip,
+                IARG_END);
+        }
     }
 
     if (INS_IsCall(ins)) {
-        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)TrackCallSite,
-            IARG_THREAD_ID,
-            IARG_ADDRINT, rip,
-            IARG_ADDRINT, rip + INS_Size(ins),
-            IARG_BRANCH_TARGET_ADDR,
-            IARG_END);
+        if (gStartRipEnabled) {
+            INS_InsertIfCall(ins, IPOINT_BEFORE, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+            INS_InsertThenCall(ins, IPOINT_BEFORE, (AFUNPTR)TrackCallSite,
+                IARG_THREAD_ID,
+                IARG_ADDRINT, rip,
+                IARG_ADDRINT, rip + INS_Size(ins),
+                IARG_BRANCH_TARGET_ADDR,
+                IARG_END);
+        }
+        else {
+            INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)TrackCallSite,
+                IARG_THREAD_ID,
+                IARG_ADDRINT, rip,
+                IARG_ADDRINT, rip + INS_Size(ins),
+                IARG_BRANCH_TARGET_ADDR,
+                IARG_END);
+        }
     }
     else if (INS_IsRet(ins)) {
-        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)TrackReturnSite,
-            IARG_THREAD_ID,
-            IARG_ADDRINT, rip,
-            IARG_BRANCH_TARGET_ADDR,
-            IARG_REG_VALUE, REG_STACK_PTR,
-            IARG_END);
+        if (gStartRipEnabled) {
+            INS_InsertIfCall(ins, IPOINT_BEFORE, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+            INS_InsertThenCall(ins, IPOINT_BEFORE, (AFUNPTR)TrackReturnSite,
+                IARG_THREAD_ID,
+                IARG_ADDRINT, rip,
+                IARG_BRANCH_TARGET_ADDR,
+                IARG_REG_VALUE, REG_STACK_PTR,
+                IARG_END);
+        }
+        else {
+            INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)TrackReturnSite,
+                IARG_THREAD_ID,
+                IARG_ADDRINT, rip,
+                IARG_BRANCH_TARGET_ADDR,
+                IARG_REG_VALUE, REG_STACK_PTR,
+                IARG_END);
+        }
     }
 
     if (INS_IsIndirectBranchOrCall(ins) || INS_IsRet(ins) || INS_IsDirectBranch(ins)) {
         if (gCfDumpEnabled) {
-            INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)NoteControlFlowIntoModifiedPage,
-                IARG_THREAD_ID,
-                IARG_ADDRINT, rip,
-                IARG_BRANCH_TARGET_ADDR,
-                IARG_END);
+            if (gStartRipEnabled) {
+                INS_InsertIfCall(ins, IPOINT_BEFORE, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+                INS_InsertThenCall(ins, IPOINT_BEFORE, (AFUNPTR)NoteControlFlowIntoModifiedPage,
+                    IARG_THREAD_ID,
+                    IARG_ADDRINT, rip,
+                    IARG_BRANCH_TARGET_ADDR,
+                    IARG_END);
+            }
+            else {
+                INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)NoteControlFlowIntoModifiedPage,
+                    IARG_THREAD_ID,
+                    IARG_ADDRINT, rip,
+                    IARG_BRANCH_TARGET_ADDR,
+                    IARG_END);
+            }
         }
     }
 
     if (isRdtsc && gTimingEnabled) {
         // 1. Record the instruction entry (Standard trace)
-        INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(Record),
-            IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_BOOL, false,
-            IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_END);
+        if (gStartRipEnabled) {
+            INS_InsertIfCall(ins, IPOINT_BEFORE, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+            INS_InsertThenCall(ins, IPOINT_BEFORE, AFUNPTR(Record),
+                IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_BOOL, false,
+                IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_END);
+        }
+        else {
+            INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(Record),
+                IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_BOOL, false,
+                IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_END);
+        }
 
         // Spoofing (Only if -spoof_time 1)
         if (gSpoofTimeEnabled) {
-            INS_InsertCall(ins, IPOINT_AFTER, AFUNPTR(HandleRdtsc), IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_CONTEXT, IARG_END);
+            if (gStartRipEnabled) {
+                INS_InsertIfCall(ins, IPOINT_AFTER, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+                INS_InsertThenCall(ins, IPOINT_AFTER, AFUNPTR(HandleRdtsc), IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_CONTEXT, IARG_END);
+            }
+            else {
+                INS_InsertCall(ins, IPOINT_AFTER, AFUNPTR(HandleRdtsc), IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_CONTEXT, IARG_END);
+            }
         }
         else {
             // If spoofing is OFF, we might still want to log the REAL output for analysis
-            INS_InsertCall(ins, IPOINT_AFTER, AFUNPTR(RecordRdtscAfter), IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_CONST_CONTEXT, IARG_END);
+            if (gStartRipEnabled) {
+                INS_InsertIfCall(ins, IPOINT_AFTER, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+                INS_InsertThenCall(ins, IPOINT_AFTER, AFUNPTR(RecordRdtscAfter), IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_CONST_CONTEXT, IARG_END);
+            }
+            else {
+                INS_InsertCall(ins, IPOINT_AFTER, AFUNPTR(RecordRdtscAfter), IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_CONST_CONTEXT, IARG_END);
+            }
+        }
+        if (gStopRipEnabled) {
+            InsertCloseGateCall(ins, IPOINT_AFTER, rip);
         }
         return;
     }
 
     if (isCpuid) {
-        INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(SaveCpuidInputs),
-            IARG_THREAD_ID,
-            IARG_REG_VALUE, REG_GAX,
-            IARG_REG_VALUE, REG_GBX,
-            IARG_REG_VALUE, REG_GCX,
-            IARG_REG_VALUE, REG_GDX,
-            IARG_END);
-        INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(Record),
-            IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_BOOL, false,
-            IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_END);
-        INS_InsertCall(ins, IPOINT_AFTER, AFUNPTR(RecordCpuidAfter),
-            IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_UINT32, INS_Size(ins), IARG_CONTEXT, IARG_END);
+        if (gStartRipEnabled) {
+            INS_InsertIfCall(ins, IPOINT_BEFORE, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+            INS_InsertThenCall(ins, IPOINT_BEFORE, AFUNPTR(SaveCpuidInputs),
+                IARG_THREAD_ID,
+                IARG_REG_VALUE, REG_GAX,
+                IARG_REG_VALUE, REG_GBX,
+                IARG_REG_VALUE, REG_GCX,
+                IARG_REG_VALUE, REG_GDX,
+                IARG_END);
+            INS_InsertIfCall(ins, IPOINT_BEFORE, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+            INS_InsertThenCall(ins, IPOINT_BEFORE, AFUNPTR(Record),
+                IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_BOOL, false,
+                IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_END);
+            INS_InsertIfCall(ins, IPOINT_AFTER, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+            INS_InsertThenCall(ins, IPOINT_AFTER, AFUNPTR(RecordCpuidAfter),
+                IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_UINT32, INS_Size(ins), IARG_CONTEXT, IARG_END);
+        }
+        else {
+            INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(SaveCpuidInputs),
+                IARG_THREAD_ID,
+                IARG_REG_VALUE, REG_GAX,
+                IARG_REG_VALUE, REG_GBX,
+                IARG_REG_VALUE, REG_GCX,
+                IARG_REG_VALUE, REG_GDX,
+                IARG_END);
+            INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(Record),
+                IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_BOOL, false,
+                IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_END);
+            INS_InsertCall(ins, IPOINT_AFTER, AFUNPTR(RecordCpuidAfter),
+                IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_UINT32, INS_Size(ins), IARG_CONTEXT, IARG_END);
+        }
+        if (gStopRipEnabled) {
+            InsertCloseGateCall(ins, IPOINT_AFTER, rip);
+        }
         return;
     }
   
 
     if (isSyscall && gSyscallEnabled) {
-        INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(RecordSyscallBefore), IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_CONST_CONTEXT, IARG_END);
+        if (gStartRipEnabled) {
+            INS_InsertIfCall(ins, IPOINT_BEFORE, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+            INS_InsertThenCall(ins, IPOINT_BEFORE, AFUNPTR(RecordSyscallBefore), IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_CONST_CONTEXT, IARG_END);
+        }
+        else {
+            INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(RecordSyscallBefore), IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_CONST_CONTEXT, IARG_END);
+        }
+        if (gStopRipEnabled) {
+            InsertCloseGateCall(ins, IPOINT_BEFORE, rip);
+        }
         return;
     }
 
     // --- Control Flow Dump Instrumentation ---
     if (gCfDumpEnabled) {
         if (INS_IsIndirectBranchOrCall(ins) || INS_IsRet(ins)) {
-            INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)RecordControlFlow,
-                IARG_THREAD_ID,
-                IARG_INST_PTR,            // Source (RIP)
-                IARG_BRANCH_TARGET_ADDR,  // Destination (Dynamically resolved by Pin)
-                IARG_REG_VALUE, REG_STACK_PTR, // Current RSP
-                IARG_CONST_CONTEXT,
-                IARG_END);
+            if (gStartRipEnabled) {
+                INS_InsertIfCall(ins, IPOINT_BEFORE, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+                INS_InsertThenCall(ins, IPOINT_BEFORE, (AFUNPTR)RecordControlFlow,
+                    IARG_THREAD_ID,
+                    IARG_INST_PTR,
+                    IARG_BRANCH_TARGET_ADDR,
+                    IARG_REG_VALUE, REG_STACK_PTR,
+                    IARG_CONST_CONTEXT,
+                    IARG_END);
+            }
+            else {
+                INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)RecordControlFlow,
+                    IARG_THREAD_ID,
+                    IARG_INST_PTR,            // Source (RIP)
+                    IARG_BRANCH_TARGET_ADDR,  // Destination (Dynamically resolved by Pin)
+                    IARG_REG_VALUE, REG_STACK_PTR, // Current RSP
+                    IARG_CONST_CONTEXT,
+                    IARG_END);
+            }
         }
     }
 	// --- Snapshot Trigger Instrumentation ---
     if(KnobSnapshotAddr.Value() != 0 && INS_Address(ins) == KnobSnapshotAddr.Value()) {
-        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)ExecuteSnapshot,
-            IARG_THREAD_ID,
-            IARG_CONST_CONTEXT,
-            IARG_END);
+        if (gStartRipEnabled) {
+            INS_InsertIfCall(ins, IPOINT_BEFORE, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+            INS_InsertThenCall(ins, IPOINT_BEFORE, (AFUNPTR)ExecuteSnapshot,
+                IARG_THREAD_ID,
+                IARG_CONST_CONTEXT,
+                IARG_PTR, "manual",
+                IARG_END);
+        }
+        else {
+            INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)ExecuteSnapshot,
+                IARG_THREAD_ID,
+                IARG_CONST_CONTEXT,
+                IARG_PTR, "manual",
+                IARG_END);
+        }
     }
     // --- InterruptTime Spoofing (Anti-Timing) ---
      // Gated behind -spoof_time 1 to prevent overhead/confusion by default.
@@ -2017,8 +2173,16 @@ static void InstrumentInstruction(INS ins, void*) {
         }
 
         if (isSpoofCandidate && dstReg != REG_INVALID()) {
-            INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)CaptureReadTarget, IARG_THREAD_ID, IARG_MEMORYREAD_EA, IARG_END);
-            INS_InsertCall(ins, IPOINT_AFTER, (AFUNPTR)SpoofSystemTime, IARG_THREAD_ID, IARG_UINT32, dstReg, IARG_CONTEXT, IARG_END);
+            if (gStartRipEnabled) {
+                INS_InsertIfCall(ins, IPOINT_BEFORE, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+                INS_InsertThenCall(ins, IPOINT_BEFORE, (AFUNPTR)CaptureReadTarget, IARG_THREAD_ID, IARG_MEMORYREAD_EA, IARG_END);
+                INS_InsertIfCall(ins, IPOINT_AFTER, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+                INS_InsertThenCall(ins, IPOINT_AFTER, (AFUNPTR)SpoofSystemTime, IARG_THREAD_ID, IARG_UINT32, dstReg, IARG_CONTEXT, IARG_END);
+            }
+            else {
+                INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)CaptureReadTarget, IARG_THREAD_ID, IARG_MEMORYREAD_EA, IARG_END);
+                INS_InsertCall(ins, IPOINT_AFTER, (AFUNPTR)SpoofSystemTime, IARG_THREAD_ID, IARG_UINT32, dstReg, IARG_CONTEXT, IARG_END);
+            }
         }
     }
 
@@ -2045,19 +2209,37 @@ static void InstrumentInstruction(INS ins, void*) {
  
 
         if (isApiTransfer) {
-            INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)OnApiCall,
-                IARG_THREAD_ID,
-                IARG_INST_PTR,            // Source (RIP)
-                IARG_BRANCH_TARGET_ADDR,  // Destination (The API Address)
-                IARG_ADDRINT, srcLowAddr, // Source Module Base
-                IARG_ADDRINT, srcHighAddr,// Source Module Ceiling
-                IARG_REG_VALUE, REG_RCX,  // Arg 0
-                IARG_REG_VALUE, REG_RDX,  // Arg 1
-                IARG_REG_VALUE, REG_R8,   // Arg 2
-                IARG_REG_VALUE, REG_R9,   // Arg 3
-                IARG_REG_VALUE, REG_STACK_PTR, // RSP
-                IARG_BOOL, INS_IsRet(ins), // <--- NEW: Tell the hook if this is a RET
-                IARG_END);
+            if (gStartRipEnabled) {
+                INS_InsertIfCall(ins, IPOINT_BEFORE, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+                INS_InsertThenCall(ins, IPOINT_BEFORE, (AFUNPTR)OnApiCall,
+                    IARG_THREAD_ID,
+                    IARG_INST_PTR,
+                    IARG_BRANCH_TARGET_ADDR,
+                    IARG_ADDRINT, srcLowAddr,
+                    IARG_ADDRINT, srcHighAddr,
+                    IARG_REG_VALUE, REG_RCX,
+                    IARG_REG_VALUE, REG_RDX,
+                    IARG_REG_VALUE, REG_R8,
+                    IARG_REG_VALUE, REG_R9,
+                    IARG_REG_VALUE, REG_STACK_PTR,
+                    IARG_BOOL, INS_IsRet(ins),
+                    IARG_END);
+            }
+            else {
+                INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)OnApiCall,
+                    IARG_THREAD_ID,
+                    IARG_INST_PTR,            // Source (RIP)
+                    IARG_BRANCH_TARGET_ADDR,  // Destination (The API Address)
+                    IARG_ADDRINT, srcLowAddr, // Source Module Base
+                    IARG_ADDRINT, srcHighAddr,// Source Module Ceiling
+                    IARG_REG_VALUE, REG_RCX,  // Arg 0
+                    IARG_REG_VALUE, REG_RDX,  // Arg 1
+                    IARG_REG_VALUE, REG_R8,   // Arg 2
+                    IARG_REG_VALUE, REG_R9,   // Arg 3
+                    IARG_REG_VALUE, REG_STACK_PTR, // RSP
+                    IARG_BOOL, INS_IsRet(ins), // <--- NEW: Tell the hook if this is a RET
+                    IARG_END);
+            }
         }
     }
 
@@ -2065,8 +2247,15 @@ static void InstrumentInstruction(INS ins, void*) {
     bool hasWrite = INS_IsMemoryWrite(ins);
 
     if (hasWrite) {
-        INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(TrackExecutableWriteBefore),
-            IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_MEMORYWRITE_EA, IARG_MEMORYWRITE_SIZE, IARG_END);
+        if (gStartRipEnabled) {
+            INS_InsertIfCall(ins, IPOINT_BEFORE, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+            INS_InsertThenCall(ins, IPOINT_BEFORE, AFUNPTR(TrackExecutableWriteBefore),
+                IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_MEMORYWRITE_EA, IARG_MEMORYWRITE_SIZE, IARG_END);
+        }
+        else {
+            INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(TrackExecutableWriteBefore),
+                IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_MEMORYWRITE_EA, IARG_MEMORYWRITE_SIZE, IARG_END);
+        }
     }
 
     IARGLIST al = IARGLIST_Alloc();
@@ -2077,25 +2266,60 @@ static void InstrumentInstruction(INS ins, void*) {
     else { IARGLIST_AddArguments(al, IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_END); }
     if (hasWrite && !safeForAfter) { IARGLIST_AddArguments(al, IARG_MEMORYWRITE_EA, IARG_MEMORYWRITE_SIZE, IARG_END); }
     else { IARGLIST_AddArguments(al, IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_END); }
-    INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(Record), IARG_IARGLIST, al, IARG_END);
+    if (gStartRipEnabled) {
+        INS_InsertIfCall(ins, IPOINT_BEFORE, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+        INS_InsertThenCall(ins, IPOINT_BEFORE, AFUNPTR(Record), IARG_IARGLIST, al, IARG_END);
+    }
+    else {
+        INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(Record), IARG_IARGLIST, al, IARG_END);
+    }
     IARGLIST_Free(al);
 
     if (gConcreteEnabled) {
         // Now Pin only generates the heavy context-saving assembly if the knob is actually ON
-        INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(RecordConcreteBefore),
-            IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_CONST_CONTEXT, IARG_END);
+        if (gStartRipEnabled) {
+            INS_InsertIfCall(ins, IPOINT_BEFORE, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+            INS_InsertThenCall(ins, IPOINT_BEFORE, AFUNPTR(RecordConcreteBefore),
+                IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_CONST_CONTEXT, IARG_END);
+        }
+        else {
+            INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(RecordConcreteBefore),
+                IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_CONST_CONTEXT, IARG_END);
+        }
 
         if (safeForAfter) {
-            INS_InsertCall(ins, IPOINT_AFTER, AFUNPTR(RecordConcreteAfter),
-                IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_UINT32, INS_Size(ins), IARG_CONST_CONTEXT, IARG_END);
+            if (gStartRipEnabled) {
+                INS_InsertIfCall(ins, IPOINT_AFTER, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+                INS_InsertThenCall(ins, IPOINT_AFTER, AFUNPTR(RecordConcreteAfter),
+                    IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_UINT32, INS_Size(ins), IARG_CONST_CONTEXT, IARG_END);
+            }
+            else {
+                INS_InsertCall(ins, IPOINT_AFTER, AFUNPTR(RecordConcreteAfter),
+                    IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_UINT32, INS_Size(ins), IARG_CONST_CONTEXT, IARG_END);
+            }
         }
     }
 
     if (hasWrite && safeForAfter) {
-        INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(CaptureWriteAddr),
-            IARG_THREAD_ID, IARG_MEMORYWRITE_EA, IARG_MEMORYWRITE_SIZE, IARG_END);
-        INS_InsertCall(ins, IPOINT_AFTER, AFUNPTR(RecordMemWriteAfter),
-            IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_UINT32, INS_MemoryWriteSize(ins), IARG_UINT32, INS_Size(ins), IARG_END);
+        if (gStartRipEnabled) {
+            INS_InsertIfCall(ins, IPOINT_BEFORE, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+            INS_InsertThenCall(ins, IPOINT_BEFORE, AFUNPTR(CaptureWriteAddr),
+                IARG_THREAD_ID, IARG_MEMORYWRITE_EA, IARG_MEMORYWRITE_SIZE, IARG_END);
+            INS_InsertIfCall(ins, IPOINT_AFTER, AFUNPTR(GateIsOpen), IARG_THREAD_ID, IARG_END);
+            INS_InsertThenCall(ins, IPOINT_AFTER, AFUNPTR(RecordMemWriteAfter),
+                IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_UINT32, INS_MemoryWriteSize(ins), IARG_UINT32, INS_Size(ins), IARG_END);
+        }
+        else {
+            INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(CaptureWriteAddr),
+                IARG_THREAD_ID, IARG_MEMORYWRITE_EA, IARG_MEMORYWRITE_SIZE, IARG_END);
+            INS_InsertCall(ins, IPOINT_AFTER, AFUNPTR(RecordMemWriteAfter),
+                IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_UINT32, INS_MemoryWriteSize(ins), IARG_UINT32, INS_Size(ins), IARG_END);
+        }
+    }
+
+    if (gStopRipEnabled) {
+        IPOINT closePoint = safeForAfter ? IPOINT_AFTER : IPOINT_BEFORE;
+        InsertCloseGateCall(ins, closePoint, rip);
     }
 }
 
@@ -2105,6 +2329,8 @@ static void ThreadStart(THREADID tid, CONTEXT* ctxt, INT32, VOID*) {
     st->tid = tid;
     if (gUseRing) st->ring.resize(gRingSize);
     st->gateOpen = gStartRipEnabled ? false : true;
+    st->heartbeatLastTime = std::chrono::steady_clock::now();
+    st->heartbeatLastInstCount = 0;
  // st->regTaint.resize(REG_LAST, 0);
     PIN_SetThreadData(gTlsKey, st, tid);
 
@@ -2521,6 +2747,7 @@ int main(int argc, char* argv[]) {
         gStartRipEnabled = true; 
     }
     else if (parseHex(KnobStart.Value(), gStartRip)) gStartRipEnabled = true;
+    if (parseHex(KnobStop.Value(), gStopRip)) gStopRipEnabled = true;
 
     auto parseTrig = [&](const std::string& b, const std::string& s, const std::string& t, const std::string& w, MemTrigger& mt) {
         if (parseHex(b, mt.base) && parseHex(s, (ADDRINT&)mt.size)) {
