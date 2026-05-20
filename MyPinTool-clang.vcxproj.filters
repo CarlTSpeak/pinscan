@@ -1,0 +1,23 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="api_tracer.cpp" />
+    <ClCompile Include="cpu_context.cpp" />
+    <ClCompile Include="exec_tracker.cpp" />
+    <ClCompile Include="heuristics.cpp" />
+    <ClCompile Include="pe_parser.cpp" />
+    <ClCompile Include="telemetry.cpp" />
+    <ClCompile Include="pinscan.cpp" />
+    <ClCompile Include="utils.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="api_tracer.h" />
+    <ClInclude Include="cpu_context.h" />
+    <ClInclude Include="exec_tracker.h" />
+    <ClInclude Include="heuristics.h" />
+    <ClInclude Include="pe_parser.h" />
+    <ClInclude Include="pinscan_globals.h" />
+    <ClInclude Include="utils.h" />
+    <ClInclude Include="telemetry.h" />
+  </ItemGroup>
+</Project>
