@@ -1,14 +1,28 @@
 #include "pinscan_globals.h"
 #include "cpu_context.h"
+#include "tracegui_csv.h"
+#include "utils.h"
 #include <sstream>
 #include <iomanip>
+#include <cctype>
 
 // --- External Dependencies (Currently living in pinscan.cpp) ---
 extern ThreadState* GetToolThreadState(THREADID tid);
 extern void DispatchEntry(ThreadState* st, const InstEntry& e);
+extern void LogTraceGuiCsvRow(const TraceGuiCsvRow& row);
 // ---------------------------------------------------------------
 
 static const ADDRINT kKuserSharedBase = 0x7ffe0000;
+static bool gCpuidRewriteEnabled = false;
+static UINT32 gCpuidRewriteMask = CPUID_REG_NONE;
+static ADDRINT gCpuidRewriteRax = 0;
+static ADDRINT gCpuidRewriteRbx = 0;
+static ADDRINT gCpuidRewriteRcx = 0;
+static ADDRINT gCpuidRewriteRdx = 0;
+
+static std::string CsvHexValue(ADDRINT value) {
+    return TraceGuiHexNoPrefix(value);
+}
 
 void CaptureReadTarget(THREADID tid, ADDRINT addr) {
     if (ThreadState* st = GetToolThreadState(tid)) {
@@ -120,6 +134,15 @@ void SaveCpuidInputs(THREADID tid, ADDRINT eax, ADDRINT ebx, ADDRINT ecx, ADDRIN
     }
 }
 
+void ConfigureCpuidRewrite(bool enabled, UINT32 mask, ADDRINT eax, ADDRINT ebx, ADDRINT ecx, ADDRINT edx) {
+    gCpuidRewriteEnabled = enabled && mask != CPUID_REG_NONE;
+    gCpuidRewriteMask = mask;
+    gCpuidRewriteRax = eax;
+    gCpuidRewriteRbx = ebx;
+    gCpuidRewriteRcx = ecx;
+    gCpuidRewriteRdx = edx;
+}
+
 static UINT32 ChangedCpuidOutputMask(const ThreadState* st, ADDRINT eax, ADDRINT ebx, ADDRINT ecx, ADDRINT edx) {
     if (!st) return CPUID_REG_NONE;
     UINT32 mask = CPUID_REG_NONE;
@@ -172,7 +195,7 @@ static UINT32 GetCpuidRelevantOutputMask(UINT32 leaf, UINT32 subleaf) {
     }
 }
 
-void RecordCpuidAfter(THREADID tid, ADDRINT rip, const CONTEXT* ctxt) {
+void RecordCpuidAfter(THREADID tid, ADDRINT rip, UINT32 insSize, CONTEXT* ctxt) {
     ThreadState* st = GetToolThreadState(tid);
     if (!st || !st->gateOpen) return;
 
@@ -182,6 +205,21 @@ void RecordCpuidAfter(THREADID tid, ADDRINT rip, const CONTEXT* ctxt) {
     ADDRINT ebx = PIN_GetContextReg(ctxt, REG_GBX);
     ADDRINT ecx = PIN_GetContextReg(ctxt, REG_GCX);
     ADDRINT edx = PIN_GetContextReg(ctxt, REG_GDX);
+    ADDRINT nativeEax = eax;
+    ADDRINT nativeEbx = ebx;
+    ADDRINT nativeEcx = ecx;
+    ADDRINT nativeEdx = edx;
+
+    if (gCpuidRewriteEnabled) {
+        if (gCpuidRewriteMask & CPUID_REG_RAX) eax = gCpuidRewriteRax & 0xFFFFFFFFu;
+        if (gCpuidRewriteMask & CPUID_REG_RBX) ebx = gCpuidRewriteRbx & 0xFFFFFFFFu;
+        if (gCpuidRewriteMask & CPUID_REG_RCX) ecx = gCpuidRewriteRcx & 0xFFFFFFFFu;
+        if (gCpuidRewriteMask & CPUID_REG_RDX) edx = gCpuidRewriteRdx & 0xFFFFFFFFu;
+        PIN_SetContextReg(ctxt, REG_GAX, eax);
+        PIN_SetContextReg(ctxt, REG_GBX, ebx);
+        PIN_SetContextReg(ctxt, REG_GCX, ecx);
+        PIN_SetContextReg(ctxt, REG_GDX, edx);
+    }
 
     UINT32 relevantMask = GetCpuidRelevantOutputMask((UINT32)st->cpuidLeaf, (UINT32)st->cpuidSubleaf);
     if (relevantMask == CPUID_REG_NONE) {
@@ -207,11 +245,59 @@ void RecordCpuidAfter(THREADID tid, ADDRINT rip, const CONTEXT* ctxt) {
         << std::hex << std::setw(8) << std::setfill('0') << (ebx & 0xFFFFFFFF) << ":"
         << std::hex << std::setw(8) << std::setfill('0') << (ecx & 0xFFFFFFFF) << ":"
         << std::hex << std::setw(8) << std::setfill('0') << (edx & 0xFFFFFFFF) << ">"
-        << " taint_mask: 0x" << std::hex << relevantMask
-        << " count: ";
+        << " taint_mask: 0x" << std::hex << relevantMask;
+    if (gCpuidRewriteEnabled) {
+        oss << " CPUID_REWRITE <native: "
+            << std::hex << std::setw(8) << std::setfill('0') << (nativeEax & 0xFFFFFFFF) << ":"
+            << std::hex << std::setw(8) << std::setfill('0') << (nativeEbx & 0xFFFFFFFF) << ":"
+            << std::hex << std::setw(8) << std::setfill('0') << (nativeEcx & 0xFFFFFFFF) << ":"
+            << std::hex << std::setw(8) << std::setfill('0') << (nativeEdx & 0xFFFFFFFF)
+            << " rewritten: "
+            << std::hex << std::setw(8) << std::setfill('0') << (eax & 0xFFFFFFFF) << ":"
+            << std::hex << std::setw(8) << std::setfill('0') << (ebx & 0xFFFFFFFF) << ":"
+            << std::hex << std::setw(8) << std::setfill('0') << (ecx & 0xFFFFFFFF) << ":"
+            << std::hex << std::setw(8) << std::setfill('0') << (edx & 0xFFFFFFFF)
+            << " mask: 0x" << std::hex << gCpuidRewriteMask << ">";
+    }
+    oss << " count: ";
     oss << cpuidCount;
 
     ce.reason = oss.str();
+
+    TraceGuiCsvRow row;
+    row.index = TraceGuiHexNoPrefix(ce.seq, 5);
+    row.address = TraceGuiHexNoPrefix(rip, 16);
+    row.bytes = TraceGuiFormatBytesColon(ReadBytesHex(rip, insSize));
+    row.disassembly = ce.dis;
+    std::ostringstream regs;
+    regs << "rax: " << CsvHexValue(st->cpuidInRax) << "\xE2\x86\x92" << CsvHexValue(eax)
+         << " rbx: " << CsvHexValue(st->cpuidInRbx) << "\xE2\x86\x92" << CsvHexValue(ebx)
+         << " rcx: " << CsvHexValue(st->cpuidInRcx) << "\xE2\x86\x92" << CsvHexValue(ecx)
+         << " rdx: " << CsvHexValue(st->cpuidInRdx) << "\xE2\x86\x92" << CsvHexValue(edx);
+    row.registers = regs.str();
+    std::ostringstream comments;
+    comments << "tid=" << (unsigned)tid
+             << " reason=cpuid leaf 0x" << std::hex << std::setw(8) << std::setfill('0') << (st->cpuidLeaf & 0xFFFFFFFF)
+             << " subleaf 0x" << std::hex << std::setw(8) << std::setfill('0') << (st->cpuidSubleaf & 0xFFFFFFFF)
+             << " output "
+             << std::hex << std::setw(8) << std::setfill('0') << (eax & 0xFFFFFFFF) << ":"
+             << std::hex << std::setw(8) << std::setfill('0') << (ebx & 0xFFFFFFFF) << ":"
+             << std::hex << std::setw(8) << std::setfill('0') << (ecx & 0xFFFFFFFF) << ":"
+             << std::hex << std::setw(8) << std::setfill('0') << (edx & 0xFFFFFFFF)
+             << " taint_mask 0x" << std::hex << relevantMask
+             << " count " << cpuidCount;
+    if (gCpuidRewriteEnabled) {
+        comments << " native_regs="
+                 << "rax:" << CsvHexValue(nativeEax)
+                 << " rbx:" << CsvHexValue(nativeEbx)
+                 << " rcx:" << CsvHexValue(nativeEcx)
+                 << " rdx:" << CsvHexValue(nativeEdx);
+    }
+    row.comments = comments.str();
+    LogTraceGuiCsvRow(row);
+
+    st->hasPendingConcrete = false;
+    st->pendingTraceGuiValid = false;
 
     DispatchEntry(st, ce);
     if (gUseRing) { DumpWindow(st); st->dumping = true; st->postRemaining = gPostFollow; }

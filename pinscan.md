@@ -109,6 +109,8 @@ When \-concrete 1 is supplied, PinScan leverages JIT-time observation matrices t
 2. **Tailored Injection (RecordConcreteBefore / RecordConcreteAfter):** Instead of dumping all general-purpose registers (IARG\_CONTEXT), it constructs an optimized argument list (IARGLIST). It instructs Pin to snapshot *only* the specific registers that participate in that instruction's execution path.  
 3. **RIP-Relative Displacement Normalisation:** To ensure that offline symbolic tracking tools can effortlessly map static control-flow edges, PinScan automatically parses relative pointer addressing arrays (rip+0x... or rip-0x...) during the disassembly phase, translating them into canonical absolute target hex strings.
 
+When `-ps_tracegui_csv` is supplied, PinScan emits a TraceGui-compatible CSV through the same gated concrete trace path. For full instruction-stream capture, combine it with `-ps_mode stream`; for targeted capture, keep the existing trigger/ring/start/stop configuration. Register and memory deltas use the compact format `r11: 6E654720→6E65B8DC` and `000000000015FD80: FFFC→FFFC`.
+
 ### **C. Dynamic Control Flow & JIT Dump Subsystem**
 
 When \-cf\_dump 1 or \-ps\_profile provenance is active, PinScan tracks code generation dynamically.  
@@ -131,6 +133,7 @@ When instructing an LLM to script test harnesses, generate automation wrappers, 
 | :---- | :---- | :---- | :---- |
 | **Output** | \-o | \[filename.txt\] | Primary destination for the human-readable text log. |
 | **Output** | \-ps\_concrete\_jsonl | \[filename.jsonl\] | High-speed stream layout for structured register/memory changes. |
+| **Output** | \-ps\_tracegui\_csv | \[filename.csv\] | TraceGui-compatible CSV stream: Index, Address, Bytes, Disassembly, Registers, Memory, Comments. Enables concrete capture automatically. |
 | **Mode** | \-ps\_mode | trigger, ring, stream | trigger: Wait for event. ring: Circular history. stream: Log all lines. |
 | **Optimization** | \-loop\_window | 0 to 256 | Sets the size of the loop squelching cache window (0 disables). |
 | **Granularity** | \-ps\_log\_level | 0, 1, 2 | 0 \= Concise (no disasm), 1 \= Standard, 2 \= Verbose tracking. |
@@ -138,6 +141,8 @@ When instructing an LLM to script test harnesses, generate automation wrappers, 
 | **Triggers** | \-timing | 0, 1 | Forces a lookback trace generation or alert on RDTSC/RDTSCP instructions. |
 | **Triggers** | \-peb | 0, 1 | Intercepts memory pointer reads targeting the Process Environment Block. |
 | **Mitigation** | \-spoof\_time | 0, 1 | Dynamically intercepts and rewrites hardware timing fields to counter anti-DBI checks. |
+| **Mitigation** | \-cpuid\_rewrite | 0, 1 | Enables CPUID output rewriting after every executed CPUID instruction. |
+| **Mitigation** | \-cpuid\_eax / \-cpuid\_ebx / \-cpuid\_ecx / \-cpuid\_edx | DWORD hex | Optional per-register CPUID replacement values. Only supplied lanes are rewritten. |
 | **Profiling** | \-ps\_profile | triage, provenance, all | Configures presets for anti-analysis tracking or control-flow analysis. |
 | **Gateways** | \-start / \-stop | \[Hex Address\] | Limits tracing exclusively to a specific address execution window. |
 

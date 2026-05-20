@@ -8,6 +8,7 @@
     <ClCompile Include="pe_parser.cpp" />
     <ClCompile Include="telemetry.cpp" />
     <ClCompile Include="pinscan.cpp" />
+    <ClCompile Include="tracegui_csv.cpp" />
     <ClCompile Include="utils.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -17,6 +18,7 @@
     <ClInclude Include="heuristics.h" />
     <ClInclude Include="pe_parser.h" />
     <ClInclude Include="pinscan_globals.h" />
+    <ClInclude Include="tracegui_csv.h" />
     <ClInclude Include="utils.h" />
     <ClInclude Include="telemetry.h" />
   </ItemGroup>

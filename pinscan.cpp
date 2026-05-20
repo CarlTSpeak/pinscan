@@ -11,6 +11,8 @@
 #include "telemetry.h"
 #include "exec_tracker.h"
 #include "api_tracer.h"
+#include "cpu_context.h"
+#include "tracegui_csv.h"
 
 #include <atomic>
 #include <chrono>
@@ -95,6 +97,11 @@ KNOB<BOOL> KnobConciseMode(KNOB_MODE_WRITEONCE, "pintool", "concise", "0", "no d
 KNOB<std::string> KnobNamed(KNOB_MODE_WRITEONCE, "pintool", "named", "", "non-main module to instrument");
 KNOB<BOOL> KnobPeb(KNOB_MODE_WRITEONCE, "pintool", "peb", "0", "trigger on PEB access");
 KNOB<BOOL> KnobSpoofTime(KNOB_MODE_WRITEONCE, "pintool", "spoof_time", "0", "Enable InterruptTime and RDTSC spoofing");
+KNOB<BOOL> KnobCpuidRewrite(KNOB_MODE_WRITEONCE, "pintool", "cpuid_rewrite", "0", "Rewrite CPUID output registers after each CPUID instruction");
+KNOB<std::string> KnobCpuidEax(KNOB_MODE_WRITEONCE, "pintool", "cpuid_eax", "", "Optional DWORD value to force into EAX after CPUID");
+KNOB<std::string> KnobCpuidEbx(KNOB_MODE_WRITEONCE, "pintool", "cpuid_ebx", "", "Optional DWORD value to force into EBX after CPUID");
+KNOB<std::string> KnobCpuidEcx(KNOB_MODE_WRITEONCE, "pintool", "cpuid_ecx", "", "Optional DWORD value to force into ECX after CPUID");
+KNOB<std::string> KnobCpuidEdx(KNOB_MODE_WRITEONCE, "pintool", "cpuid_edx", "", "Optional DWORD value to force into EDX after CPUID");
 KNOB<UINT64> KnobHeartbeat(KNOB_MODE_WRITEONCE, "pintool", "heartbeat", "0", "Log progress every N instructions (0 = disabled).");
 KNOB<BOOL> KnobCFDump(KNOB_MODE_WRITEONCE, "pintool", "cf_dump", "0", "Dump control flow targets, stack, and VM context during gated execution");
 KNOB<std::string> KnobProfile(KNOB_MODE_WRITEONCE, "pintool", "ps_profile", "", "Comma-separated semantic profile names (triage, provenance, all)");
@@ -102,6 +109,7 @@ KNOB<ADDRINT> KnobSnapshotAddr(KNOB_MODE_WRITEONCE, "pintool", "snapshot", "0", 
 KNOB<BOOL> KnobConcrete(KNOB_MODE_WRITEONCE, "pintool", "concrete", "0", "Record concrete IN/OUT register values");
 KNOB<UINT64> KnobMaxLines(KNOB_MODE_WRITEONCE, "pintool", "max_lines", "0", "Maximum lines to print (0 = unlimited)");
 KNOB<std::string> KnobConcreteTrace(KNOB_MODE_WRITEONCE, "pintool", "ps_concrete_jsonl", "", "Path for high-performance concrete trace JSONL");
+KNOB<std::string> KnobTraceGuiCsv(KNOB_MODE_WRITEONCE, "pintool", "ps_tracegui_csv", "", "Path for TraceGui-compatible CSV output");
 
 
 // Memory Triggers
@@ -157,6 +165,8 @@ static UINT64 gMaxLinesPrinted = 0;
 static std::atomic<UINT64> gLinesPrinted{ 0 };
 static FILE* gConcreteTraceFile = nullptr;
 static PIN_LOCK gConcreteTraceLock;
+static FILE* gTraceGuiCsvFile = nullptr;
+static PIN_LOCK gTraceGuiCsvLock;
 
 // PEB Access Detection
 static bool gPebEnabled = false;
@@ -1238,6 +1248,171 @@ static void RecordControlFlow(THREADID tid, ADDRINT rip, ADDRINT target, ADDRINT
 }
 
 // -------------------- Analysis --------------------
+static const REG kTraceGuiRegByMaskIndex[16] = {
+    REG_GAX, REG_GBX, REG_GCX, REG_GDX, REG_GSI, REG_GDI, REG_GBP, REG_R8,
+    REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15, REG_STACK_PTR
+};
+
+static const char* kTraceGuiRegNameByMaskIndex[16] = {
+    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "r8",
+    "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rsp"
+};
+
+void LogTraceGuiCsvRow(const TraceGuiCsvRow& row) {
+    if (!gTraceGuiCsvFile) return;
+    std::string line = TraceGuiFormatRow(row);
+    PIN_GetLock(&gTraceGuiCsvLock, 1);
+    std::fprintf(gTraceGuiCsvFile, "%s\n", line.c_str());
+    PIN_ReleaseLock(&gTraceGuiCsvLock);
+}
+
+static std::string TraceGuiValue(ADDRINT value) {
+    return TraceGuiHexNoPrefix(value);
+}
+
+static std::string TraceGuiNormalizeHexValue(const std::string& value) {
+    size_t start = 0;
+    if (value.size() >= 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
+        start = 2;
+    }
+    std::string out;
+    out.reserve(value.size() - start);
+    for (size_t i = start; i < value.size(); ++i) {
+        unsigned char ch = static_cast<unsigned char>(value[i]);
+        out.push_back(static_cast<char>(std::toupper(ch)));
+    }
+    return out;
+}
+
+static std::string TraceGuiMemoryValue(ADDRINT addr, UINT32 size) {
+    if (addr == 0 || size == 0) return "";
+    return TraceGuiNormalizeHexValue(ReadMemHex(addr, size));
+}
+
+static std::string TraceGuiBuildRegisterColumn(const ThreadState* st) {
+    if (!st) return "";
+    UINT32 mask = st->pendingTraceGuiReadMask | st->pendingTraceGuiWriteMask;
+    std::ostringstream oss;
+    bool first = true;
+    for (int i = 0; i < 16; ++i) {
+        if ((mask & (1u << i)) == 0) continue;
+        if (!first) oss << ' ';
+        oss << kTraceGuiRegNameByMaskIndex[i] << ": ";
+        if ((st->pendingTraceGuiWriteMask & (1u << i)) && (st->pendingTraceGuiAfterMask & (1u << i))) {
+            oss << TraceGuiValue(st->pendingTraceGuiRegBefore[i])
+                << "\xE2\x86\x92" << TraceGuiValue(st->pendingTraceGuiRegAfter[i]);
+        }
+        else {
+            oss << TraceGuiValue(st->pendingTraceGuiRegBefore[i]);
+        }
+        first = false;
+    }
+    return oss.str();
+}
+
+static void TraceGuiAppendMemCell(std::ostringstream& oss, bool& first, ADDRINT addr,
+    const std::string& before, const std::string& after) {
+    if (addr == 0 || (before.empty() && after.empty())) return;
+    if (!first) oss << ' ';
+    oss << TraceGuiHexNoPrefix(addr, 16) << ": ";
+    if (!before.empty() && !after.empty()) oss << before << "\xE2\x86\x92" << after;
+    else if (!after.empty()) oss << after;
+    else oss << before;
+    first = false;
+}
+
+static std::string TraceGuiBuildMemoryColumn(const ThreadState* st) {
+    if (!st) return "";
+    std::ostringstream oss;
+    bool first = true;
+    TraceGuiAppendMemCell(oss, first, st->pendingTraceGuiReadAddr1, st->pendingTraceGuiReadValue1, "");
+    TraceGuiAppendMemCell(oss, first, st->pendingTraceGuiReadAddr2, st->pendingTraceGuiReadValue2, "");
+    TraceGuiAppendMemCell(oss, first, st->pendingTraceGuiWriteAddr,
+        st->pendingTraceGuiWriteBefore, st->pendingTraceGuiWriteAfter);
+    return oss.str();
+}
+
+static void TraceGuiResetPending(ThreadState* st) {
+    if (!st) return;
+    st->pendingTraceGuiValid = false;
+    st->pendingTraceGuiDeferForWrite = false;
+    st->pendingTraceGuiReadMask = 0;
+    st->pendingTraceGuiWriteMask = 0;
+    st->pendingTraceGuiAfterMask = 0;
+    st->pendingTraceGuiReadAddr1 = 0;
+    st->pendingTraceGuiReadSize1 = 0;
+    st->pendingTraceGuiReadValue1.clear();
+    st->pendingTraceGuiReadAddr2 = 0;
+    st->pendingTraceGuiReadSize2 = 0;
+    st->pendingTraceGuiReadValue2.clear();
+    st->pendingTraceGuiWriteAddr = 0;
+    st->pendingTraceGuiWriteSize = 0;
+    st->pendingTraceGuiWriteBefore.clear();
+    st->pendingTraceGuiWriteAfter.clear();
+}
+
+static void TraceGuiEmitPending(ThreadState* st, UINT32 insSize) {
+    if (!st || !st->pendingTraceGuiValid) return;
+    if (!gTraceGuiCsvFile) {
+        TraceGuiResetPending(st);
+        return;
+    }
+
+    TraceGuiCsvRow row;
+    row.index = TraceGuiHexNoPrefix(st->pendingConcreteEntry.seq, 5);
+    row.address = TraceGuiHexNoPrefix(st->pendingConcreteEntry.rip, 16);
+    if (insSize == 0) {
+        auto it = gStaticByRip.find(st->pendingConcreteEntry.rip);
+        if (it != gStaticByRip.end()) insSize = it->second.size;
+    }
+    row.bytes = TraceGuiFormatBytesColon(ReadBytesHex(st->pendingConcreteEntry.rip, insSize));
+    row.disassembly = st->pendingConcreteEntry.dis;
+    size_t regsPos = row.disassembly.find(" | REGS:");
+    size_t memPos = row.disassembly.find(" | MEM:");
+    size_t cutPos = std::min(regsPos == std::string::npos ? row.disassembly.size() : regsPos,
+        memPos == std::string::npos ? row.disassembly.size() : memPos);
+    row.disassembly.resize(cutPos);
+    row.registers = TraceGuiBuildRegisterColumn(st);
+    row.memory = TraceGuiBuildMemoryColumn(st);
+
+    std::ostringstream comments;
+    comments << "tid=" << (unsigned)st->pendingConcreteEntry.tid;
+    if (!st->pendingConcreteEntry.mod.empty()) comments << " mod=" << st->pendingConcreteEntry.mod;
+    if (st->pendingConcreteEntry.rva != 0) comments << " rva=0x" << TraceGuiHexNoPrefix(st->pendingConcreteEntry.rva);
+    if (!st->pendingConcreteEntry.reason.empty()) comments << " reason=" << st->pendingConcreteEntry.reason;
+    row.comments = comments.str();
+
+    LogTraceGuiCsvRow(row);
+    TraceGuiResetPending(st);
+}
+
+static void TraceGuiPreparePending(ThreadState* st, ADDRINT rip,
+    ADDRINT r1, UINT32 r1Size, ADDRINT r2, UINT32 r2Size,
+    ADDRINT w1, UINT32 w1Size) {
+    if (!st) return;
+    TraceGuiResetPending(st);
+    st->pendingTraceGuiValid = true;
+
+    auto it = gStaticByRip.find(rip);
+    if (it != gStaticByRip.end()) {
+        st->pendingTraceGuiReadMask = it->second.gprReadMask;
+        st->pendingTraceGuiWriteMask = it->second.gprWriteMask;
+    }
+
+    st->pendingTraceGuiReadAddr1 = r1;
+    st->pendingTraceGuiReadSize1 = r1Size;
+    st->pendingTraceGuiReadValue1 = TraceGuiMemoryValue(r1, r1Size);
+    st->pendingTraceGuiReadAddr2 = r2;
+    st->pendingTraceGuiReadSize2 = r2Size;
+    st->pendingTraceGuiReadValue2 = TraceGuiMemoryValue(r2, r2Size);
+
+    if (w1 != 0 && w1Size != 0) {
+        st->pendingTraceGuiWriteAddr = w1;
+        st->pendingTraceGuiWriteSize = w1Size;
+        st->pendingTraceGuiWriteBefore = TraceGuiMemoryValue(w1, w1Size);
+    }
+}
+
 static void Record(THREADID tid, ADDRINT rip, BOOL mnemonicInteresting,
     BOOL isPushImm, ADDRINT r1, UINT32 r1Size, ADDRINT r2, UINT32 r2Size,
     ADDRINT w1, UINT32 w1Size) {
@@ -1249,6 +1424,7 @@ static void Record(THREADID tid, ADDRINT rip, BOOL mnemonicInteresting,
 
     // Flush pending concrete entries
     if (st->hasPendingConcrete) {
+        TraceGuiEmitPending(st, 0);
         DispatchEntry(st, st->pendingConcreteEntry);
         st->hasPendingConcrete = false;
     }
@@ -1396,6 +1572,7 @@ static void Record(THREADID tid, ADDRINT rip, BOOL mnemonicInteresting,
     st->pendingConcreteEntry = e;
     st->pendingConcreteDump = interesting;
     st->hasPendingConcrete = true;
+    TraceGuiPreparePending(st, rip, r1, r1Size, r2, r2Size, w1, w1Size);
 
     if (st->dumping && st->postRemaining > 0) {
         DispatchEntry(st, e);
@@ -1416,8 +1593,14 @@ static void RecordConcreteBefore(THREADID tid, ADDRINT rip, const CONTEXT* ctxt)
     if (!st || !st->hasPendingConcrete) return;
 
     auto it = gStaticByRip.find(rip);
-    if (it != gStaticByRip.end() && it->second.gprReadMask != 0) {
-        st->pendingConcreteEntry.dis += " | IN: [" + ExtractMaskedRegs(ctxt, it->second.gprReadMask) + "]";
+    if (it != gStaticByRip.end()) {
+        UINT32 mask = it->second.gprReadMask | it->second.gprWriteMask;
+        for (int i = 0; i < 16; ++i) {
+            if (mask & (1u << i)) {
+                st->pendingTraceGuiRegBefore[i] =
+                    PIN_GetContextReg(const_cast<CONTEXT*>(ctxt), kTraceGuiRegByMaskIndex[i]);
+            }
+        }
     }
 }
 
@@ -1458,18 +1641,39 @@ static void RecordConcreteAfter(THREADID tid, ADDRINT rip, UINT32 insSize, const
         LogConcreteEventJson(oss.str());
     }
 
-    // Text logging of register writes
-    if (it != gStaticByRip.end() && it->second.gprWriteMask != 0) {
-        st->pendingConcreteEntry.dis += " | OUT: [" + ExtractMaskedRegs(ctxt, it->second.gprWriteMask) + "]";
+    if (it != gStaticByRip.end()) {
+        for (int i = 0; i < 16; ++i) {
+            if (it->second.gprWriteMask & (1u << i)) {
+                st->pendingTraceGuiRegAfter[i] =
+                    PIN_GetContextReg(const_cast<CONTEXT*>(ctxt), kTraceGuiRegByMaskIndex[i]);
+                st->pendingTraceGuiAfterMask |= (1u << i);
+            }
+        }
     }
+
+    std::string regs = TraceGuiBuildRegisterColumn(st);
+    if (!regs.empty()) {
+        st->pendingConcreteEntry.dis += " | REGS: [" + regs + "]";
+    }
+
+    if (st->pendingTraceGuiDeferForWrite) {
+        return;
+    }
+    TraceGuiEmitPending(st, insSize);
     DispatchEntry(st, st->pendingConcreteEntry);
     if (st->pendingConcreteDump && gUseRing) { DumpWindow(st); st->dumping = true; st->postRemaining = gPostFollow; }
 
     st->hasPendingConcrete = false;
 }
 
-static void CaptureWriteAddr(THREADID tid, ADDRINT addr) {
-    if (ThreadState* st = GetToolThreadState(tid)) st->pendingWriteAddr = addr;
+static void CaptureWriteAddr(THREADID tid, ADDRINT addr, UINT32 size) {
+    if (ThreadState* st = GetToolThreadState(tid)) {
+        st->pendingWriteAddr = addr;
+        st->pendingTraceGuiWriteAddr = addr;
+        st->pendingTraceGuiWriteSize = size;
+        st->pendingTraceGuiWriteBefore = TraceGuiMemoryValue(addr, size);
+        st->pendingTraceGuiDeferForWrite = st->pendingTraceGuiValid;
+    }
 }
 
 static void RecordMemWriteAfter(THREADID tid, ADDRINT rip, UINT32 size, UINT32 insSize) {
@@ -1477,6 +1681,21 @@ static void RecordMemWriteAfter(THREADID tid, ADDRINT rip, UINT32 size, UINT32 i
     if (!st || !st->gateOpen) return;
 
     ADDRINT addr = st->pendingWriteAddr;
+    if (st->pendingTraceGuiValid && st->pendingTraceGuiWriteAddr == 0) {
+        st->pendingTraceGuiWriteAddr = addr;
+        st->pendingTraceGuiWriteSize = size;
+    }
+    if (st->pendingTraceGuiValid) {
+        st->pendingTraceGuiWriteAfter = TraceGuiMemoryValue(addr, size);
+        std::string mem = TraceGuiBuildMemoryColumn(st);
+        if (!mem.empty()) {
+            st->pendingConcreteEntry.dis += " | MEM: [" + mem + "]";
+        }
+        TraceGuiEmitPending(st, insSize);
+        DispatchEntry(st, st->pendingConcreteEntry);
+        if (st->pendingConcreteDump && gUseRing) { DumpWindow(st); st->dumping = true; st->postRemaining = gPostFollow; }
+        st->hasPendingConcrete = false;
+    }
 
     // Trigger check
     if (InMemTrigger(addr, size, true)) {
@@ -1497,9 +1716,10 @@ static void RecordMemWriteAfter(THREADID tid, ADDRINT rip, UINT32 size, UINT32 i
         auto it = gStaticByRip.find(rip);
         if (it != gStaticByRip.end()) { we.dis = it->second.dis; we.mod = it->second.mod; we.rva = it->second.rva; }
         std::ostringstream oss;
-        oss << "CONCRETE_MEM_WRITE <addr: " << Hex(addr)
-            << " size: " << std::dec << size
-            << " val: " << GetMemContent(addr, size) << ">";
+        oss << "CONCRETE_MEM_WRITE <"
+            << TraceGuiHexNoPrefix(addr, 16) << ": "
+            << TraceGuiMemoryValue(addr, size)
+            << " size: " << std::dec << size << ">";
         we.reason = oss.str();
         DispatchEntry(st, we);
     }
@@ -1698,7 +1918,8 @@ static void InstrumentInstruction(INS ins, void*) {
         INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(Record),
             IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_BOOL, false,
             IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_ADDRINT, 0, IARG_UINT32, 0, IARG_END);
-        INS_InsertCall(ins, IPOINT_AFTER, AFUNPTR(RecordCpuidAfter), IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_CONST_CONTEXT, IARG_END);
+        INS_InsertCall(ins, IPOINT_AFTER, AFUNPTR(RecordCpuidAfter),
+            IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_UINT32, INS_Size(ins), IARG_CONTEXT, IARG_END);
         return;
     }
   
@@ -1821,7 +2042,8 @@ static void InstrumentInstruction(INS ins, void*) {
     }
 
     if (hasWrite && safeForAfter) {
-        INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(CaptureWriteAddr), IARG_THREAD_ID, IARG_MEMORYWRITE_EA, IARG_END);
+        INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(CaptureWriteAddr),
+            IARG_THREAD_ID, IARG_MEMORYWRITE_EA, IARG_MEMORYWRITE_SIZE, IARG_END);
         INS_InsertCall(ins, IPOINT_AFTER, AFUNPTR(RecordMemWriteAfter),
             IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_UINT32, INS_MemoryWriteSize(ins), IARG_UINT32, INS_Size(ins), IARG_END);
     }
@@ -2087,6 +2309,10 @@ static void Fini(INT32 code, void*) {
         std::fflush(gConcreteTraceFile);
         std::fclose(gConcreteTraceFile);
     }
+    if (gTraceGuiCsvFile) {
+        std::fflush(gTraceGuiCsvFile);
+        std::fclose(gTraceGuiCsvFile);
+    }
     PIN_ReleaseLock(&gLock);
 }
 
@@ -2116,12 +2342,14 @@ static void PrintConfigBanner() {
             gStopRipEnabled ? Hex(gStopRip).c_str() : "disabled");
 		std::fprintf(gOut, "  %-60s = %s\n", "max_lines - max instructions to log (0 for unlimited)", gMaxLinesPrinted > 0 ? std::to_string(gMaxLinesPrinted).c_str() : "unlimited");
 		std::fprintf(gOut, "  %-60s = %s\n", "concrete - record concrete memory values", gConcreteEnabled ? "enabled" : "disabled");
+        std::fprintf(gOut, "  %-60s = %s\n", "ps_tracegui_csv - TraceGui CSV output", gTraceGuiCsvFile ? "enabled" : "disabled");
         std::fprintf(gOut, "  %-60s = %s\n", "kuser - show/resolve KUSER_SHARED_DATA reads", gKuserEnabled ? "enabled" : "disabled");
         std::fprintf(gOut, "  %-60s = %s\n", "rdtsc - record rdtsc instruction", gTimingEnabled ? "enabled" : "disabled");
         std::fprintf(gOut, "  %-60s = %s\n", "syscall - show/resolve syscalls", gSyscallEnabled ? "enabled" : "disabled");
         std::fprintf(gOut, "  %-60s = %s\n", "api - show API calls", gApiEnabled ? "enabled" : "disabled");
         std::fprintf(gOut, "  %-60s = %s\n", "peb - show PEB reads and resolve fields", gPebEnabled ? "enabled" : "disabled");
         std::fprintf(gOut, "  %-60s = %s\n", "spoof_time - spoof rdtsc/KUSER InterruptTiming", gSpoofTimeEnabled ? "enabled" : "disabled");
+        std::fprintf(gOut, "  %-60s = %s\n", "cpuid_rewrite - rewrite CPUID output registers", KnobCpuidRewrite.Value() ? "enabled" : "disabled");
         std::fprintf(gOut, "  %-60s = %s\n", "ps_profile - semantic profile set", gProfile.empty() ? "disabled" : gProfile.c_str());
         std::fprintf(gOut, "  %-60s = %s\n", "cf_dump - gated control-flow dump", gCfDumpEnabled ? "enabled" : "disabled");
         std::fprintf(gOut, "  %-60s = %s\n", "cf_provenance - indirect call/ret provenance", gCfProvenanceEnabled ? "enabled" : "disabled");
@@ -2218,6 +2446,26 @@ int main(int argc, char* argv[]) {
         return (end && *end == '\0');
         };
 
+    auto parseHexAllowZero = [&](const std::string& s, ADDRINT& val) -> bool {
+        if (s.empty()) return false;
+        std::string t = (s.find("0x") == 0 || s.find("0X") == 0) ? s.substr(2) : s;
+        if (t.empty()) return false;
+        char* end = nullptr; val = std::strtoull(t.c_str(), &end, 16);
+        return (end && *end == '\0');
+        };
+
+    UINT32 cpuidRewriteMask = CPUID_REG_NONE;
+    ADDRINT cpuidRewriteEax = 0;
+    ADDRINT cpuidRewriteEbx = 0;
+    ADDRINT cpuidRewriteEcx = 0;
+    ADDRINT cpuidRewriteEdx = 0;
+    if (parseHexAllowZero(KnobCpuidEax.Value(), cpuidRewriteEax)) cpuidRewriteMask |= CPUID_REG_RAX;
+    if (parseHexAllowZero(KnobCpuidEbx.Value(), cpuidRewriteEbx)) cpuidRewriteMask |= CPUID_REG_RBX;
+    if (parseHexAllowZero(KnobCpuidEcx.Value(), cpuidRewriteEcx)) cpuidRewriteMask |= CPUID_REG_RCX;
+    if (parseHexAllowZero(KnobCpuidEdx.Value(), cpuidRewriteEdx)) cpuidRewriteMask |= CPUID_REG_RDX;
+    ConfigureCpuidRewrite(KnobCpuidRewrite.Value(), cpuidRewriteMask,
+        cpuidRewriteEax, cpuidRewriteEbx, cpuidRewriteEcx, cpuidRewriteEdx);
+
     if ((KnobStart.Value() == "never")) {
         gStartGateDisabled = true; 
         gStartRipEnabled = true; 
@@ -2253,6 +2501,7 @@ int main(int argc, char* argv[]) {
     std::string outJsonPath = KnobOutJson.Value();
 
     std::string concreteTracePath = KnobConcreteTrace.Value();
+    std::string traceGuiCsvPath = KnobTraceGuiCsv.Value();
 
     if (!concreteTracePath.empty()) {
         size_t dot = concreteTracePath.find_last_of('.');
@@ -2263,6 +2512,20 @@ int main(int argc, char* argv[]) {
         // Disable standard C buffering to prevent lost data if the DRM intentionally crashes
         if (gConcreteTraceFile) setvbuf(gConcreteTraceFile, nullptr, _IONBF, 0);
         PIN_InitLock(&gConcreteTraceLock);
+    }
+
+    if (!traceGuiCsvPath.empty()) {
+        size_t dot = traceGuiCsvPath.find_last_of('.');
+        if (dot != std::string::npos) traceGuiCsvPath.insert(dot, "_" + std::to_string(pid));
+        else traceGuiCsvPath += "_" + std::to_string(pid) + ".csv";
+
+        gTraceGuiCsvFile = std::fopen(traceGuiCsvPath.c_str(), "w");
+        if (gTraceGuiCsvFile) {
+            setvbuf(gTraceGuiCsvFile, nullptr, _IOFBF, 4 * 1024 * 1024);
+            std::fprintf(gTraceGuiCsvFile, "Index,Address,Bytes,Disassembly,Registers,Memory,Comments\n");
+            gConcreteEnabled = true;
+        }
+        PIN_InitLock(&gTraceGuiCsvLock);
     }
 
     if (!outTxtPath.empty()) {

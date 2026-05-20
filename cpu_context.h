@@ -21,6 +21,7 @@ void RecordRdtscAfter(THREADID tid, ADDRINT rip, const CONTEXT* ctxt);
 
 // CPUID Handling
 void SaveCpuidInputs(THREADID tid, ADDRINT eax, ADDRINT ebx, ADDRINT ecx, ADDRINT edx);
-void RecordCpuidAfter(THREADID tid, ADDRINT rip, const CONTEXT* ctxt);
+void ConfigureCpuidRewrite(bool enabled, UINT32 mask, ADDRINT eax, ADDRINT ebx, ADDRINT ecx, ADDRINT edx);
+void RecordCpuidAfter(THREADID tid, ADDRINT rip, UINT32 insSize, CONTEXT* ctxt);
 
 #endif // PINSCAN_CPU_CONTEXT_H
