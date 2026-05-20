@@ -1049,11 +1049,46 @@ static bool BuildRflagsWrite(INS ins) {
 
 static void FlushPendingConcreteEntry(ThreadState* st, UINT32 insSize);
 
+static void MaybeEmitHeartbeat(ThreadState* st, THREADID tid, ADDRINT rip, const char* phase) {
+    if (!st || gHeartbeatInterval == 0) return;
+
+    st->instCount++;
+    if (st->instCount % gHeartbeatInterval != 0) return;
+
+    auto now = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(now - st->heartbeatLastTime).count();
+    UINT64 deltaInst = st->instCount - st->heartbeatLastInstCount;
+    double ips = (elapsed > 0.0) ? (static_cast<double>(deltaInst) / elapsed) : 0.0;
+    st->heartbeatLastTime = now;
+    st->heartbeatLastInstCount = st->instCount;
+
+    PIN_GetLock(&gLock, 1);
+    if (gOut) {
+        std::string loc = "unknown";
+        auto it = gStaticByRip.find(rip);
+        if (it != gStaticByRip.end()) {
+            std::ostringstream oss;
+            oss << it->second.mod << "+" << std::hex << it->second.rva;
+            loc = oss.str();
+        }
+        std::fprintf(gOut, "[HEARTBEAT] phase=%s tid=%u count=%llu ips=%.0f interval=%llu elapsed=%.3fs rip=%s (%s)\n",
+            phase ? phase : "trace",
+            (unsigned)tid, (unsigned long long)st->instCount,
+            ips, (unsigned long long)deltaInst, elapsed,
+            Hex(rip).c_str(), loc.c_str());
+    }
+    PIN_ReleaseLock(&gLock);
+}
+
 static ADDRINT CheckAndOpenGate(THREADID tid, ADDRINT rip) {
     if (!gStartRipEnabled || gStartGateDisabled) return 0;
 
     ThreadState* st = GetToolThreadState(tid);
-    if (st && !st->gateOpen && rip == gStartRip) {
+    if (!st) return 0;
+    if (!st->gateOpen && rip != gStartRip) {
+        MaybeEmitHeartbeat(st, tid, rip, "pre_start");
+    }
+    if (!st->gateOpen && rip == gStartRip) {
         st->gateOpen = true;
         PIN_GetLock(&gLock, 0);
         std::fprintf(gOut ? gOut : stderr, "[pinscan] tid=%u start hit at %s\n", (unsigned)tid, Hex(rip).c_str());
@@ -1483,34 +1518,7 @@ static void Record(THREADID tid, ADDRINT rip, BOOL mnemonicInteresting,
     // Increment the global timeline unconditionally and save our spot
     uint64_t currentSeq = ++gSeqCounter;
 
-    // Fast thread-local heartbeat
-    if (gHeartbeatInterval > 0) {
-        st->instCount++;
-        if (st->instCount % gHeartbeatInterval == 0) {
-            auto now = std::chrono::steady_clock::now();
-            double elapsed = std::chrono::duration<double>(now - st->heartbeatLastTime).count();
-            UINT64 deltaInst = st->instCount - st->heartbeatLastInstCount;
-            double ips = (elapsed > 0.0) ? (static_cast<double>(deltaInst) / elapsed) : 0.0;
-            st->heartbeatLastTime = now;
-            st->heartbeatLastInstCount = st->instCount;
-
-            PIN_GetLock(&gLock, 1);
-            if (gOut) {
-                std::string loc = "unknown";
-                auto it = gStaticByRip.find(rip);
-                if (it != gStaticByRip.end()) {
-                    std::ostringstream oss;
-                    oss << it->second.mod << "+" << std::hex << it->second.rva;
-                    loc = oss.str();
-                }
-                std::fprintf(gOut, "[HEARTBEAT] tid=%u count=%llu ips=%.0f interval=%llu elapsed=%.3fs rip=%s (%s)\n",
-                    (unsigned)tid, (unsigned long long)st->instCount,
-                    ips, (unsigned long long)deltaInst, elapsed,
-                    Hex(rip).c_str(), loc.c_str());
-            }
-            PIN_ReleaseLock(&gLock);
-        }
-    }
+    MaybeEmitHeartbeat(st, tid, rip, "trace");
 
     if (gVerbose || (gLogLevel == 2)) { CheckFirstExecutionAfterWrite(tid, rip); }
 
