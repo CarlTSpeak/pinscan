@@ -1318,6 +1318,7 @@ void LogTraceGuiCsvRow(const TraceGuiCsvRow& row) {
     std::string line = TraceGuiFormatRow(row);
     PIN_GetLock(&gTraceGuiCsvLock, 1);
     std::fprintf(gTraceGuiCsvFile, "%s\n", line.c_str());
+    std::fflush(gTraceGuiCsvFile);
     PIN_ReleaseLock(&gTraceGuiCsvLock);
 }
 
@@ -1826,25 +1827,11 @@ static void UpdateLastRip(THREADID tid, ADDRINT rip) {
 
 static void InsertCloseGateCall(INS ins, IPOINT point, ADDRINT rip) {
     if (!gStopRipEnabled) return;
-    if (gConcreteEnabled) {
-        INS_InsertIfCall(ins, point, (AFUNPTR)CheckAndCloseGate,
-            IARG_THREAD_ID,
-            IARG_ADDRINT, rip,
-            IARG_UINT32, INS_Size(ins),
-            IARG_END);
-        INS_InsertThenCall(ins, point, (AFUNPTR)ExecuteSnapshot,
-            IARG_THREAD_ID,
-            IARG_CONST_CONTEXT,
-            IARG_PTR, "stop",
-            IARG_END);
-    }
-    else {
-        INS_InsertCall(ins, point, (AFUNPTR)CheckAndCloseGate,
-            IARG_THREAD_ID,
-            IARG_ADDRINT, rip,
-            IARG_UINT32, INS_Size(ins),
-            IARG_END);
-    }
+    INS_InsertCall(ins, point, (AFUNPTR)CheckAndCloseGate,
+        IARG_THREAD_ID,
+        IARG_ADDRINT, rip,
+        IARG_UINT32, INS_Size(ins),
+        IARG_END);
 }
 
 static void InstrumentInstruction(INS ins, void*) {
@@ -1957,23 +1944,10 @@ static void InstrumentInstruction(INS ins, void*) {
     INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)UpdateLastRip, IARG_THREAD_ID, IARG_ADDRINT, rip, IARG_END);
 
     if (gStartRipEnabled) {
-        if (gConcreteEnabled) {
-            INS_InsertIfCall(ins, IPOINT_BEFORE, (AFUNPTR)CheckAndOpenGate,
-                IARG_THREAD_ID,
-                IARG_ADDRINT, rip,
-                IARG_END);
-            INS_InsertThenCall(ins, IPOINT_BEFORE, (AFUNPTR)ExecuteSnapshot,
-                IARG_THREAD_ID,
-                IARG_CONST_CONTEXT,
-                IARG_PTR, "start",
-                IARG_END);
-        }
-        else {
-            INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)CheckAndOpenGate,
-                IARG_THREAD_ID,
-                IARG_ADDRINT, rip,
-                IARG_END);
-        }
+        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)CheckAndOpenGate,
+            IARG_THREAD_ID,
+            IARG_ADDRINT, rip,
+            IARG_END);
     }
 
     if (INS_IsCall(ins)) {
@@ -2816,7 +2790,11 @@ int main(int argc, char* argv[]) {
         if (gTraceGuiCsvFile) {
             setvbuf(gTraceGuiCsvFile, nullptr, _IOFBF, 4 * 1024 * 1024);
             std::fprintf(gTraceGuiCsvFile, "Index,Address,Bytes,Disassembly,Registers,Memory,Comments\n");
+            std::fflush(gTraceGuiCsvFile);
             gConcreteEnabled = true;
+            gStreamMode = true;
+            gUseRing = false;
+            gMode = "stream";
         }
         PIN_InitLock(&gTraceGuiCsvLock);
     }
