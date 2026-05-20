@@ -1852,6 +1852,14 @@ static void InstrumentInstruction(INS ins, void*) {
 
     ADDRINT rip = INS_Address(ins);
 
+    if (gStartRipEnabled && !gStartGateDisabled && rip != gStartRip) {
+        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)CheckAndOpenGate,
+            IARG_THREAD_ID,
+            IARG_ADDRINT, rip,
+            IARG_END);
+        return;
+    }
+
     PIN_GetLock(&g_EpLock, 1);
     bool isEntryPoint = (g_DllEntryPoints.find(rip) != g_DllEntryPoints.end());
     PIN_ReleaseLock(&g_EpLock);
