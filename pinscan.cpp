@@ -1026,6 +1026,27 @@ static UINT32 BuildGprWriteMask(INS ins) {
     return mask;
 }
 
+static bool IsRflagsReg(REG reg) {
+    std::string name = REG_StringShort(reg);
+    std::transform(name.begin(), name.end(), name.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return name == "rflags" || name == "eflags" || name == "flags";
+}
+
+static bool BuildRflagsRead(INS ins) {
+    for (UINT32 i = 0; i < INS_MaxNumRRegs(ins); ++i) {
+        if (IsRflagsReg(INS_RegR(ins, i))) return true;
+    }
+    return false;
+}
+
+static bool BuildRflagsWrite(INS ins) {
+    for (UINT32 i = 0; i < INS_MaxNumWRegs(ins); ++i) {
+        if (IsRflagsReg(INS_RegW(ins, i))) return true;
+    }
+    return false;
+}
+
 static void CheckAndOpenGate(THREADID tid, ADDRINT rip, const CONTEXT* ctxt) {
     if (!gStartRipEnabled || gStartGateDisabled) return;
 
@@ -1307,6 +1328,17 @@ static std::string TraceGuiBuildRegisterColumn(const ThreadState* st) {
         }
         first = false;
     }
+    if (st->pendingTraceGuiRflagsRead || st->pendingTraceGuiRflagsWrite) {
+        if (!first) oss << ' ';
+        oss << "rflags: ";
+        if (st->pendingTraceGuiRflagsWrite && st->pendingTraceGuiRflagsAfter) {
+            oss << TraceGuiValue(st->pendingTraceGuiRflagsBefore)
+                << "\xE2\x86\x92" << TraceGuiValue(st->pendingTraceGuiRflagsAfterValue);
+        }
+        else {
+            oss << TraceGuiValue(st->pendingTraceGuiRflagsBefore);
+        }
+    }
     return oss.str();
 }
 
@@ -1339,6 +1371,11 @@ static void TraceGuiResetPending(ThreadState* st) {
     st->pendingTraceGuiReadMask = 0;
     st->pendingTraceGuiWriteMask = 0;
     st->pendingTraceGuiAfterMask = 0;
+    st->pendingTraceGuiRflagsRead = false;
+    st->pendingTraceGuiRflagsWrite = false;
+    st->pendingTraceGuiRflagsAfter = false;
+    st->pendingTraceGuiRflagsBefore = 0;
+    st->pendingTraceGuiRflagsAfterValue = 0;
     st->pendingTraceGuiReadAddr1 = 0;
     st->pendingTraceGuiReadSize1 = 0;
     st->pendingTraceGuiReadValue1.clear();
@@ -1397,6 +1434,8 @@ static void TraceGuiPreparePending(ThreadState* st, ADDRINT rip,
     if (it != gStaticByRip.end()) {
         st->pendingTraceGuiReadMask = it->second.gprReadMask;
         st->pendingTraceGuiWriteMask = it->second.gprWriteMask;
+        st->pendingTraceGuiRflagsRead = it->second.rflagsRead;
+        st->pendingTraceGuiRflagsWrite = it->second.rflagsWrite;
     }
 
     st->pendingTraceGuiReadAddr1 = r1;
@@ -1601,6 +1640,10 @@ static void RecordConcreteBefore(THREADID tid, ADDRINT rip, const CONTEXT* ctxt)
                     PIN_GetContextReg(const_cast<CONTEXT*>(ctxt), kTraceGuiRegByMaskIndex[i]);
             }
         }
+        if (it->second.rflagsRead || it->second.rflagsWrite) {
+            st->pendingTraceGuiRflagsBefore =
+                PIN_GetContextReg(const_cast<CONTEXT*>(ctxt), REG_RFLAGS);
+        }
     }
 }
 
@@ -1648,6 +1691,11 @@ static void RecordConcreteAfter(THREADID tid, ADDRINT rip, UINT32 insSize, const
                     PIN_GetContextReg(const_cast<CONTEXT*>(ctxt), kTraceGuiRegByMaskIndex[i]);
                 st->pendingTraceGuiAfterMask |= (1u << i);
             }
+        }
+        if (it->second.rflagsWrite) {
+            st->pendingTraceGuiRflagsAfterValue =
+                PIN_GetContextReg(const_cast<CONTEXT*>(ctxt), REG_RFLAGS);
+            st->pendingTraceGuiRflagsAfter = true;
         }
     }
 
@@ -1816,6 +1864,8 @@ static void InstrumentInstruction(INS ins, void*) {
     st.isControlFlow = INS_IsControlFlow(ins);
     st.gprReadMask = BuildGprReadMask(ins);
     st.gprWriteMask = BuildGprWriteMask(ins);
+    st.rflagsRead = BuildRflagsRead(ins);
+    st.rflagsWrite = BuildRflagsWrite(ins);
 
     gStaticByRip[rip] = st;
 

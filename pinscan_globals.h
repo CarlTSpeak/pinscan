@@ -84,6 +84,11 @@ struct ThreadState {
     UINT32 pendingTraceGuiAfterMask{ 0 };
     std::array<ADDRINT, 16> pendingTraceGuiRegBefore{};
     std::array<ADDRINT, 16> pendingTraceGuiRegAfter{};
+    bool pendingTraceGuiRflagsRead{ false };
+    bool pendingTraceGuiRflagsWrite{ false };
+    bool pendingTraceGuiRflagsAfter{ false };
+    ADDRINT pendingTraceGuiRflagsBefore{ 0 };
+    ADDRINT pendingTraceGuiRflagsAfterValue{ 0 };
     ADDRINT pendingTraceGuiReadAddr1{ 0 };
     UINT32 pendingTraceGuiReadSize1{ 0 };
     std::string pendingTraceGuiReadValue1;
@@ -162,6 +167,8 @@ struct InstStatic {
     bool isControlFlow{ false };
     UINT32 gprReadMask{ 0 };
     UINT32 gprWriteMask{ 0 };
+    bool rflagsRead{ false };
+    bool rflagsWrite{ false };
 };
 
 // -------------------- Globals --------------------
